@@ -1,0 +1,361 @@
+/*
+note this code is implemented in Mbed 2
+*/
+
+#include "mbed.h"
+#include<iostream>
+
+using namespace std;
+
+// define servo positions
+#define center 0.074f 
+#define left 0.05f
+#define right 0.1f
+#define slope 0.025 
+
+// define PWM frequency
+#define frequency 50.0f 
+#define drive_frequency 20000.0f
+
+// PD controller parameters 
+#define ti 0.001  // 1 kHz
+//#define Kp 0.45f // Kp = 0.5
+#define Kd 0.8f // Kd = 0.8
+
+// PI controller parameters
+//#define Kp_driving 0.6f
+
+// controller tolerance
+#define tol 0.001f
+
+// initialize wait state 
+int state = 0;
+
+// steering pins
+AnalogIn sensor_right(PTB0); 
+AnalogIn sensor_left(PTB1); 
+PwmOut pwm(PTD4);
+
+// driving pins
+AnalogIn right_tach(PTB2);
+AnalogIn left_tach(PTB3);
+
+// LED outputs for localization
+DigitalOut segment1(PTC12);
+DigitalOut segment2(PTC13);
+DigitalOut segment3(PTC16);
+DigitalOut segment4(PTC17);
+
+/*
+DigitalOut segment5(PTB8); DigitalOut segment6(PTB9); DigitalOut segment7(PTB10); DigitalOut segment8(PTE2); DigitalOut segment9(PTE3);
+*/
+
+// arrowhead sensor inputs
+AnalogIn left_land_mark(PTC1);
+AnalogIn right_land_mark(PTC2);
+
+// breaker inputs
+DigitalIn breaker_left(PTD6);
+DigitalIn breaker_right(PTD7);
+
+// gate driver signals
+PwmOut g1(PTE20);
+PwmOut g2(PTE21);
+
+// user input
+DigitalIn user_in(PTE31);
+
+// state LED
+PwmOut Rled(PTB18); PwmOut Gled(PTB19); 
+
+//--------------------PD controller---------------------------
+float duty;
+float prev_error = 0;
+float err;
+float diff_sensor;
+float error_rate;
+float controller_output;
+
+float Kp = 0.35;
+float Kp_driving = 0.6;
+
+void read_diff()
+{
+    diff_sensor = (sensor_left*1.4 - sensor_right*2.8); // right * 2.5
+}
+
+void pd_controller()
+{
+    err = -1*diff_sensor;
+    error_rate = (err - prev_error);//ti;
+    controller_output = Kp*err + Kd*error_rate;
+
+    duty = center + slope*controller_output;
+
+    if (duty > right){
+        duty = right;
+    }
+    else if (duty < left){
+        duty = left;
+    }
+
+    pwm.pulsewidth(duty*1/frequency);
+
+    prev_error = err;
+}
+
+//--------------------PI controller---------------------------
+float set_point = 0;
+float tach_slope = 0.1723;
+float max_duty = 0.6;
+
+float right_speed = 0;
+float error_right = 0;
+float right_output = 0;
+float right_duty = 0;
+float left_duty = 0;
+
+void read_tach(){
+    right_speed = right_tach; 
+}
+
+void pi_controller()
+{
+    error_right = set_point - right_speed;
+    right_output = Kp_driving*error_right;
+    
+    right_duty = (set_point + right_output)*tach_slope;
+
+    if (right_duty > max_duty){
+        right_duty = max_duty;
+    }
+    else if (right_duty < 0){
+        right_duty = 0;
+    }
+    left_duty = right_duty;
+}
+
+//--------------------localization---------------------------
+int counter = 0;
+int lap = 0;
+int ignore_next = 0;
+
+void segment_clear(){
+    segment1.write(0);
+    segment2.write(0);
+    segment3.write(0);
+    segment4.write(0);
+}
+
+void segment_display(int counter){
+
+    switch (counter){
+        case 0:
+            break;
+        case 1:
+            segment_clear();
+            segment1.write(1);
+            break;
+        case 2:
+            segment_clear();
+            segment2.write(1);
+            break;
+        case 3:
+            segment_clear();
+            segment2.write(1);
+            segment1.write(1);
+            break;
+        case 4:
+            segment_clear();
+            segment3.write(1);
+            break;
+        case 5:
+            segment_clear();
+            segment3.write(1);
+            segment1.write(1);
+            break;
+        case 6:
+            segment_clear();
+            segment3.write(1);
+            segment2.write(1);
+            break;
+        case 7:
+            segment_clear();
+            segment3.write(1);
+            segment2.write(1);
+            segment1.write(1);
+            break;
+        case 8:
+            segment_clear();
+            segment4.write(1);
+            break;
+        case 9:
+            segment_clear();
+            break;
+        case 10:
+            segment_clear();
+            segment4.write(1);
+            segment2.write(1);
+            break;
+        case 11:
+            segment_clear();
+            segment4.write(1);
+            segment2.write(1);
+            segment1.write(1);
+    }
+}
+
+void read_counter(){
+
+    if (ignore_next>0 && ignore_next < 750){
+        ignore_next++;
+        return;
+    }
+    else {
+        ignore_next = 0;
+    }
+
+    if (counter > 11){
+        counter = 0;
+        lap++; 
+    }
+    else if (left_land_mark.read()*3.3 <= 2.8 || right_land_mark.read()*3.3 <= 2.8){
+        counter++;
+        ignore_next++;
+    } 
+    segment_display(counter);
+}
+
+//--------------------state---------------------------
+void break_car(){
+
+    g1.pulsewidth(0);
+    g2.pulsewidth(0);
+
+    read_diff();
+    read_counter();
+}
+
+void led_state(float l1, float l2){
+    Rled.period_us(47);
+    Rled=l1;Gled.period_us(47);
+    Gled=l2;
+}
+
+float straight = 0.1; // 0.125
+
+void check_state(){
+
+    
+    // check if off track
+    if (sensor_left.read()*3.3 < 0.05 && sensor_right.read()*3.3 < 0.05){
+        state = 2;    
+    }
+
+    /*
+    if (breaker_right.read() == 1 /*|| breaker_left.read() == 1){
+        state = 2;
+    }
+    */
+
+    switch (state){
+
+        case 0:
+            //led_state(0.5, 0.5);
+            if (user_in.read() == 0){
+                state = 1;
+                wait_us(500000);
+            }
+            read_diff();
+            break;
+
+        case 1:
+            
+            read_diff();
+            read_tach();
+            read_counter();
+
+            //led_state(1,0);
+            g1.period(1/drive_frequency);
+            g2.period(1/drive_frequency);
+
+            if (abs(diff_sensor) < straight){
+                Kp = 0.35;
+                Kp_driving = 0.6;
+                set_point = 1.75; //2.1
+            }
+
+            else {
+                 
+                if (diff_sensor > 0){
+                    left_duty = 0.85*right_duty;
+                }
+                else{
+                    right_duty = 0.85*left_duty;
+                }
+                    Kp = 0.5;
+                    Kp_driving = 0.8; // 0.7
+                    set_point = 1.8;  // 1.85
+                }
+
+            g1.pulsewidth(right_duty/drive_frequency);
+            g2.pulsewidth(left_duty/drive_frequency);
+            
+            if (user_in.read() == 0){
+                state = 0;
+                break_car();
+                wait_us(500000);
+            }
+            break;
+
+        case 2:
+            //led_state(0,1);
+            if (user_in.read() == 0){
+                state = 0;
+                wait_us(500000);
+            }
+
+            // break
+            break_car();
+
+            read_diff();
+        break;
+    }
+}
+
+void ld_controller(){
+
+    switch (state){
+        case 0:
+            led_state(0.5, 0.5);
+            break;
+        case 1:
+            led_state(1,0);
+            break;
+        default:
+            led_state(0,1);
+        break;
+    }
+}
+
+int main() {
+
+    // initialize steering pwm
+    pwm.period(1/frequency);
+    pwm.pulsewidth(center*1/frequency);
+    
+    // steering Ticker
+    Ticker steering_timer;
+    steering_timer.attach(&pd_controller, 12ms);
+
+    // driving Ticker
+    Ticker driving_timer;
+    driving_timer.attach(&pi_controller, 20ms);
+    //capcitance Ticker
+    Ticker led_timer;
+    led_timer.attach(&ld_controller,1ms);
+
+    while(true) {
+        check_state();
+    }
+}
